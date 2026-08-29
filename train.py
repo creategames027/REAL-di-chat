@@ -6,32 +6,29 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 from torch.amp import GradScaler, autocast
+from torch.utils.data import DataLoader
 
 from core.config import DIConfig
 from core.model import RealDIChat
+from data.dataset import build_datasets
 from tokenizer import BPETokenizer
 
 
-def make_batch(data, batch_size, seq_len, device):
-    if len(data) <= seq_len + 1:
-        raise ValueError("Dataset must contain more than context_length + 1 tokens.")
-    starts = torch.randint(0, len(data) - seq_len - 1, (batch_size,))
-    x = torch.stack([data[i:i + seq_len] for i in starts])
-    y = torch.stack([data[i + 1:i + seq_len + 1] for i in starts])
-    return x.to(device), y.to(device)
-
-
-@torch.no_grad()
-def evaluate(model, data, batch_size, seq_len, device, batches=20):
+def evaluate(model, loader, device, batches):
     model.eval()
-    losses = []
-    for _ in range(batches):
-        x, y = make_batch(data, batch_size, seq_len, device)
-        with autocast(device_type=device.type, dtype=torch.float16, enabled=device.type == "cuda"):
-            logits = model(x)
-            loss = F.cross_entropy(logits.reshape(-1, model.config.vocab_size), y.reshape(-1))
-        losses.append(loss.item())
-    mean_loss = sum(losses) / len(losses)
+    total_loss = 0.0
+    count = 0
+    with torch.no_grad():
+        for x, y in loader:
+            x, y = x.to(device), y.to(device)
+            with autocast(device_type=device.type, dtype=torch.float16, enabled=device.type == "cuda"):
+                logits = model(x)
+                loss = F.cross_entropy(logits.reshape(-1, model.config.vocab_size), y.reshape(-1))
+            total_loss += loss.item()
+            count += 1
+            if count >= batches:
+                break
+    mean_loss = total_loss / max(count, 1)
     return mean_loss, math.exp(min(mean_loss, 20.0))
 
 
@@ -70,11 +67,13 @@ def main():
     parser.add_argument("--save-every", type=int, default=250)
     parser.add_argument("--eval-every", type=int, default=100)
     parser.add_argument("--eval-batches", type=int, default=20)
+    parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--resume", default=None)
     args = parser.parse_args()
 
-    text = Path(args.data).read_text(encoding="utf-8")
+    train_path = Path(args.data)
     val_path = Path(args.val_data)
+    text = train_path.read_text(encoding="utf-8")
     tokenizer_path = Path(args.tokenizer)
     tokenizer = load_or_train_tokenizer(text, tokenizer_path, args.vocab_size)
 
@@ -84,20 +83,20 @@ def main():
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.1)
     scaler = GradScaler("cuda", enabled=device.type == "cuda")
 
-    ids = tokenizer.encode(text, add_bos=True, add_eos=True)
-    tokens = torch.tensor(ids, dtype=torch.long)
-
-    if val_path.exists():
-        val_ids = tokenizer.encode(val_path.read_text(encoding="utf-8"), add_bos=True, add_eos=True)
-        train_data, val_data = tokens, torch.tensor(val_ids, dtype=torch.long)
-    else:
-        split = int(len(tokens) * 0.9)
-        train_data, val_data = tokens[:split], tokens[split:]
-        print("val.txt not found; using deterministic 90/10 split")
+    train_set, val_set = build_datasets(
+        train_path, val_path, tokenizer, config.context_length
+    )
+    train_loader = DataLoader(
+        train_set, batch_size=args.batch_size, shuffle=True,
+        num_workers=args.num_workers, pin_memory=device.type == "cuda"
+    )
+    val_loader = DataLoader(
+        val_set, batch_size=args.batch_size, shuffle=False,
+        num_workers=args.num_workers, pin_memory=device.type == "cuda"
+    )
 
     start_step = 0
     best_val_loss = float("inf")
-
     if args.resume:
         checkpoint = torch.load(args.resume, map_location=device, weights_only=False)
         saved_config = DIConfig(**checkpoint["config"])
@@ -105,26 +104,32 @@ def main():
             raise ValueError("Tokenizer vocabulary does not match checkpoint vocabulary.")
         model.load_state_dict(checkpoint["model"])
         optimizer.load_state_dict(checkpoint["optimizer"])
-        scaler.load_state_dict(checkpoint.get("scaler", {}))
+        if checkpoint.get("scaler"):
+            scaler.load_state_dict(checkpoint["scaler"])
         start_step = int(checkpoint.get("step", 0))
         best_val_loss = float(checkpoint.get("best_val_loss", float("inf")))
         print(f"resumed from step {start_step}")
 
     print(f"REAL DI CHAT 1 | device={device}")
     print(f"parameters={model.parameter_count:,} | vocab={config.vocab_size}")
-    print(f"tokens={len(tokens):,} | train={len(train_data):,} | val={len(val_data):,}")
+    print(f"train sequences={len(train_set):,} | val sequences={len(val_set):,}")
 
+    train_iter = iter(train_loader)
     last_step = start_step
     for step in range(start_step + 1, start_step + args.steps + 1):
         last_step = step
-        model.train()
-        x, y = make_batch(train_data, args.batch_size, config.context_length, device)
+        try:
+            x, y = next(train_iter)
+        except StopIteration:
+            train_iter = iter(train_loader)
+            x, y = next(train_iter)
 
+        model.train()
+        x, y = x.to(device), y.to(device)
         optimizer.zero_grad(set_to_none=True)
         with autocast(device_type=device.type, dtype=torch.float16, enabled=device.type == "cuda"):
             logits = model(x)
             loss = F.cross_entropy(logits.reshape(-1, config.vocab_size), y.reshape(-1))
-
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -135,28 +140,16 @@ def main():
             print(f"step {step:5d} | train_loss {loss.item():.4f}")
 
         if step % args.eval_every == 0 or step == start_step + args.steps:
-            val_loss, perplexity = evaluate(
-                model, val_data, args.batch_size, config.context_length, device, args.eval_batches
-            )
+            val_loss, perplexity = evaluate(model, val_loader, device, args.eval_batches)
             print(f"step {step:5d} | val_loss {val_loss:.4f} | perplexity {perplexity:.2f}")
-
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
-                save_checkpoint(
-                    Path("checkpoints/best.pt"), model, optimizer, scaler,
-                    tokenizer_path, step, best_val_loss
-                )
+                save_checkpoint(Path("checkpoints/best.pt"), model, optimizer, scaler, tokenizer_path, step, best_val_loss)
                 print("best checkpoint saved")
 
         if step % args.save_every == 0 or step == start_step + args.steps:
-            save_checkpoint(
-                Path(f"checkpoints/real_di_chat_step_{step}.pt"),
-                model, optimizer, scaler, tokenizer_path, step, best_val_loss
-            )
-            save_checkpoint(
-                Path("checkpoints/latest.pt"), model, optimizer, scaler,
-                tokenizer_path, step, best_val_loss
-            )
+            save_checkpoint(Path(f"checkpoints/real_di_chat_step_{step}.pt"), model, optimizer, scaler, tokenizer_path, step, best_val_loss)
+            save_checkpoint(Path("checkpoints/latest.pt"), model, optimizer, scaler, tokenizer_path, step, best_val_loss)
             print("checkpoint saved")
 
     print(f"training finished at step {last_step}")
