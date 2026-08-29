@@ -1,0 +1,13 @@
+```
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Checkpoints and models
+checkpoints/
+
+# Data files
+data/tokenizer.json
+```
