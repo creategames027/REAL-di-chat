@@ -5,22 +5,17 @@ from pathlib import Path
 
 
 TOKEN_PATTERN = re.compile(r"\w+|[^\w\s]", re.UNICODE)
+CHAT_SPECIAL_TOKENS = ["<|system|>", "<|user|>", "<|assistant|>", "<|end|>"]
 
 
 class BPETokenizer:
-    """Small, self-contained BPE tokenizer for REAL DI CHAT.
-
-    It learns a subword vocabulary from text and encodes unseen words by
-    repeatedly applying the learned merge rules. The implementation is
-    intentionally dependency-free so the tokenizer can be inspected and
-    extended as part of the project.
-    """
+    """Small self-contained BPE tokenizer with chat role tokens."""
 
     def __init__(self, vocab_size=8000):
-        if vocab_size < 16:
-            raise ValueError("vocab_size must be at least 16")
+        if vocab_size < 32:
+            raise ValueError("vocab_size must be at least 32")
         self.vocab_size = vocab_size
-        self.special_tokens = ["<pad>", "<unk>", "<bos>", "<eos>"]
+        self.special_tokens = ["<pad>", "<unk>", "<bos>", "<eos>"] + CHAT_SPECIAL_TOKENS
         self.vocab = {}
         self.id_to_token = {}
         self.merges = []
@@ -58,8 +53,7 @@ class BPETokenizer:
     def train(self, text):
         words = self._initial_words(text)
         symbols = set(s for word in words for s in word)
-
-        target = max(len(self.special_tokens), self.vocab_size)
+        target = self.vocab_size
         while len(symbols) + len(self.special_tokens) < target:
             pairs = self._pair_counts(words)
             if not pairs:
@@ -68,13 +62,11 @@ class BPETokenizer:
             if frequency < 2:
                 break
             self.merges.append(pair)
-            merged = pair[0] + pair[1]
-            symbols.add(merged)
+            symbols.add(pair[0] + pair[1])
             words = self._merge_pair(words, pair)
 
         tokens = self.special_tokens + sorted(symbols)
-        tokens = tokens[:self.vocab_size]
-        self.vocab = {token: i for i, token in enumerate(tokens)}
+        self.vocab = {token: i for i, token in enumerate(tokens[:self.vocab_size])}
         self.id_to_token = {i: token for token, i in self.vocab.items()}
         return self
 
@@ -97,17 +89,24 @@ class BPETokenizer:
         ids = []
         if add_bos:
             ids.append(self.vocab["<bos>"])
-        for token in TOKEN_PATTERN.findall(text):
-            for piece in self._encode_word(token):
-                ids.append(self.vocab.get(piece, self.vocab["<unk>"]))
+        # Special chat tokens must stay atomic; ordinary text uses BPE.
+        parts = re.split(r"(<\|system\|>|<\|user\|>|<\|assistant\|>|<\|end\|>)", text)
+        for part in parts:
+            if not part:
+                continue
+            if part in self.special_tokens:
+                ids.append(self.vocab[part])
+                continue
+            for token in TOKEN_PATTERN.findall(part):
+                for piece in self._encode_word(token):
+                    ids.append(self.vocab.get(piece, self.vocab["<unk>"]))
         if add_eos:
             ids.append(self.vocab["<eos>"])
         return ids
 
     def decode(self, ids):
         pieces = [self.id_to_token.get(int(i), "<unk>") for i in ids]
-        text = "".join(pieces).replace("</w>", " ")
-        return text.strip()
+        return "".join(pieces).replace("</w>", " ").strip()
 
     def save(self, path):
         payload = {
