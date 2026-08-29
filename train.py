@@ -8,22 +8,7 @@ from torch.amp import GradScaler, autocast
 
 from core.config import DIConfig
 from core.model import RealDIChat
-
-
-SPECIAL = {"<pad>": 0, "<unk>": 1, "<bos>": 2, "<eos>": 3}
-
-
-def build_vocab(text, vocab_size):
-    chars = sorted(set(text))
-    chars = chars[: max(0, vocab_size - len(SPECIAL))]
-    itos = list(SPECIAL.keys()) + chars
-    stoi = {ch: i for i, ch in enumerate(itos)}
-    return stoi, itos
-
-
-def encode(text, stoi):
-    unk = stoi["<unk>"]
-    return [stoi.get(ch, unk) for ch in text]
+from tokenizer import BPETokenizer
 
 
 def make_batch(data, batch_size, seq_len, device):
@@ -36,8 +21,10 @@ def make_batch(data, batch_size, seq_len, device):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train REAL DI CHAT 1")
+    parser = argparse.ArgumentParser(description="Train REAL DI CHAT 1 with BPE")
     parser.add_argument("--data", default="data/train.txt")
+    parser.add_argument("--tokenizer", default="data/tokenizer.json")
+    parser.add_argument("--vocab-size", type=int, default=8000)
     parser.add_argument("--steps", type=int, default=1000)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--lr", type=float, default=3e-4)
@@ -45,21 +32,31 @@ def main():
     args = parser.parse_args()
 
     text = Path(args.data).read_text(encoding="utf-8")
-    config = DIConfig()
-    stoi, itos = build_vocab(text, config.vocab_size)
-    config.vocab_size = len(itos)
+    tokenizer_path = Path(args.tokenizer)
 
+    if tokenizer_path.exists():
+        tokenizer = BPETokenizer.load(tokenizer_path)
+    else:
+        tokenizer = BPETokenizer(args.vocab_size).train(text)
+        tokenizer_path.parent.mkdir(parents=True, exist_ok=True)
+        tokenizer.save(tokenizer_path)
+        print(f"trained tokenizer -> {tokenizer_path}")
+
+    config = DIConfig(vocab_size=len(tokenizer.vocab))
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = RealDIChat(config).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.1)
     scaler = GradScaler("cuda", enabled=device.type == "cuda")
 
-    tokens = torch.tensor(encode(text, stoi), dtype=torch.long)
-    split = max(1, int(len(tokens) * 0.9))
+    ids = tokenizer.encode(text, add_bos=True, add_eos=True)
+    tokens = torch.tensor(ids, dtype=torch.long)
+    split = max(config.context_length + 2, int(len(tokens) * 0.9))
+    split = min(split, len(tokens) - 1)
     train_data, val_data = tokens[:split], tokens[split:]
 
     print(f"REAL DI CHAT 1 | device={device}")
     print(f"parameters={model.parameter_count:,} | vocab={config.vocab_size}")
+    print(f"tokens={len(tokens):,} | train={len(train_data):,} | val={len(val_data):,}")
 
     for step in range(1, args.steps + 1):
         model.train()
@@ -84,8 +81,7 @@ def main():
             torch.save({
                 "model": model.state_dict(),
                 "config": config.__dict__,
-                "stoi": stoi,
-                "itos": itos,
+                "tokenizer": str(tokenizer_path),
                 "step": step,
             }, f"checkpoints/real_di_chat_step_{step}.pt")
             print("checkpoint saved")
