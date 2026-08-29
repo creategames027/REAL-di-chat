@@ -3,10 +3,10 @@ from dataclasses import dataclass
 
 @dataclass
 class DIConfig:
-    vocab_size: int = 32_000
-    context_length: int = 512
-    d_model: int = 384
-    n_layers: int = 8
+    vocab_size: int = 256
+    context_length: int = 128
+    d_model: int = 256
+    n_layers: int = 6
     n_heads: int = 8
     n_kv_heads: int = 4
     ffn_multiplier: float = 2.67
